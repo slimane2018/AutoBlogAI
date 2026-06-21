@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* minimal styles for buttons/inputs */
+.btn { @apply inline-block bg-blue-600 text-white px-4 py-2 rounded; }
+.input { @apply border p-2 rounded w-full; }
