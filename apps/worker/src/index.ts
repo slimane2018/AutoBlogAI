@@ -1,20 +1,23 @@
-import { Worker, QueueScheduler } from "bullmq";
-import IORedis from "ioredis";
-import prisma from "@/lib/prisma";
-import { fetchNeuronBrief } from "./services/neuronwriter";
-import { generateOutline, generateArticle } from "./services/openai";
+import { Worker, QueueScheduler, Queue } from 'bullmq';
+import IORedis from 'ioredis';
+import prisma from '@/lib/prisma';
+import { fetchNeuronBrief } from './services/neuronwriter';
+import { generateOutline, generateArticle } from './services/openai';
+import { decrypt } from './utils/crypto';
+import { publishPost, uploadMedia } from './services/wordpress';
 
 const connection = new IORedis(process.env.REDIS_URL!);
-new QueueScheduler("content-generation", { connection });
+new QueueScheduler('content-generation', { connection });
+const publishQueue = new Queue('content-generation', { connection });
 
 const worker = new Worker(
-  "content-generation",
+  'content-generation',
   async job => {
     console.log(`Processing job ${job.id} ${job.name}`);
-    if (job.name === "pipeline:start") {
+    if (job.name === 'pipeline:start') {
       const { keywordId, neuronWriterAccountId, websiteId } = job.data as any;
       const keyword = await prisma.keyword.findUnique({ where: { id: keywordId } });
-      if (!keyword) throw new Error("Keyword not found");
+      if (!keyword) throw new Error('Keyword not found');
 
       // 1. Fetch NeuronWriter brief
       const brief = await fetchNeuronBrief(neuronWriterAccountId, keyword.keyword);
@@ -32,12 +35,12 @@ const worker = new Worker(
           rawResponse: brief.raw,
         },
       });
-      await prisma.keyword.update({ where: { id: keyword.id }, data: { status: "BRIEF_RETRIEVED" } });
+      await prisma.keyword.update({ where: { id: keyword.id }, data: { status: 'BRIEF_RETRIEVED' } });
 
       // 2. Generate outline
       const outlineResult = await generateOutline(brief);
       const outline = await prisma.outline.create({ data: { keywordId: keyword.id, sections: outlineResult.sections as any } });
-      await prisma.keyword.update({ where: { id: keyword.id }, data: { status: "OUTLINE_CREATED" } });
+      await prisma.keyword.update({ where: { id: keyword.id }, data: { status: 'OUTLINE_CREATED' } });
 
       // 3. Generate article
       const articleResult = await generateArticle({ brief, outline: outlineResult });
@@ -51,23 +54,68 @@ const worker = new Worker(
           content: articleResult.html,
           wordCount: articleResult.wordCount,
           readability: articleResult.readability,
-          status: "DRAFT",
+          status: 'DRAFT',
           websiteId: websiteId,
           keywordId: keyword.id,
           outlineId: outline.id,
         },
       });
 
-      await prisma.keyword.update({ where: { id: keyword.id }, data: { status: "ARTICLE_GENERATED" } });
+      await prisma.keyword.update({ where: { id: keyword.id }, data: { status: 'ARTICLE_GENERATED' } });
 
       console.log(`Article ${article.id} created for keyword ${keyword.keyword}`);
+    }
+
+    if (job.name === 'publish:article') {
+      const { articleId, websiteId, publishAs } = job.data as any;
+      const article = await prisma.article.findUnique({ where: { id: articleId }, include: { images: true } });
+      if (!article) throw new Error('Article not found');
+      const website = await prisma.website.findUnique({ where: { id: websiteId } });
+      if (!website) throw new Error('Website not found');
+
+      // decrypt WP password
+      const wpPassword = decrypt(website.applicationPassword);
+      try {
+        // upload featured image if present
+        let featuredMediaId: number | undefined;
+        if (article.images && article.images.length > 0) {
+          // take first image
+          const img = article.images[0];
+          // fetch image bytes
+          const res = await fetch(img.url);
+          if (res.ok) {
+            const buf = Buffer.from(await res.arrayBuffer());
+            const mime = res.headers.get('content-type') || 'image/jpeg';
+            const upload = await uploadMedia(website.siteUrl, website.username, wpPassword, buf, `featured-${article.slug}.jpg`, mime);
+            featuredMediaId = upload.id;
+          }
+        }
+
+        const post = {
+          title: article.title,
+          content: article.content,
+          status: publishAs === 'publish' ? 'publish' : 'draft',
+          excerpt: article.metaDescription || undefined,
+          featured_media: featuredMediaId,
+        };
+
+        const published = await publishPost(website.siteUrl, website.username, wpPassword, post);
+
+        await prisma.publishingLog.create({ data: { articleId: article.id, websiteId: website.id, status: 'SUCCESS', remoteId: String(published.id), response: published } });
+        await prisma.article.update({ where: { id: article.id }, data: { status: 'PUBLISHED' } });
+      } catch (err: any) {
+        console.error('Publish failed', err);
+        await prisma.publishingLog.create({ data: { articleId: article.id, websiteId: website.id, status: 'FAILED', message: err.message, response: { error: err.message } } });
+        await prisma.article.update({ where: { id: article.id }, data: { status: 'FAILED' } });
+        throw err; // allow BullMQ to retry according to queue policy
+      }
     }
   },
   { connection }
 );
 
-worker.on("failed", (job, err) => {
+worker.on('failed', (job, err) => {
   console.error(`Job failed ${job?.id} ${job?.name}`, err);
 });
 
-console.log("Worker started");
+console.log('Worker started');
