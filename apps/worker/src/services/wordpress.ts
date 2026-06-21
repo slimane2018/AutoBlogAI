@@ -1,6 +1,7 @@
 import fetch from 'node-fetch';
 import prisma from '@/lib/prisma';
-import { decrypt } from './utils/crypto';
+import { decrypt } from '../utils/crypto';
+import { processImageBuffer } from './imageProcessor';
 
 function wpAuthHeader(username: string, appPassword: string) {
   return 'Basic ' + Buffer.from(`${username}:${appPassword}`).toString('base64');
@@ -30,13 +31,39 @@ export async function uploadMedia(siteUrl: string, username: string, appPassword
   return res.json();
 }
 
+export async function createTagIfNotExists(siteUrl: string, username: string, appPassword: string, tagName: string) {
+  // Attempt to find tag by name
+  const base = siteUrl.replace(/\/$/, '');
+  const searchRes = await fetch(`${base}/wp-json/wp/v2/tags?search=${encodeURIComponent(tagName)}`, { headers: { Authorization: wpAuthHeader(username, appPassword) } });
+  if (!searchRes.ok) {
+    // fallback to create
+  } else {
+    const items = await searchRes.json();
+    const found = items.find((t: any) => t.name.toLowerCase() === tagName.toLowerCase());
+    if (found) return found.id;
+  }
+
+  // create
+  const createRes = await fetch(`${base}/wp-json/wp/v2/tags`, {
+    method: 'POST',
+    headers: { Authorization: wpAuthHeader(username, appPassword), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: tagName }),
+  });
+  if (!createRes.ok) {
+    const text = await createRes.text();
+    throw new Error(`Create tag failed: ${text}`);
+  }
+  const tagJson = await createRes.json();
+  return tagJson.id;
+}
+
 export async function publishPost(siteUrl: string, username: string, appPassword: string, post: {
   title: string;
   content: string;
   status?: 'publish' | 'draft';
   excerpt?: string;
   categories?: number[];
-  tags?: string[];
+  tags?: number[];
   featured_media?: number;
   meta?: any;
 }) {

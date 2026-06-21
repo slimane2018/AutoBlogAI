@@ -4,7 +4,9 @@ import prisma from '@/lib/prisma';
 import { fetchNeuronBrief } from './services/neuronwriter';
 import { generateOutline, generateArticle } from './services/openai';
 import { decrypt } from './utils/crypto';
-import { publishPost, uploadMedia } from './services/wordpress';
+import { publishPost, uploadMedia, createTagIfNotExists } from './services/wordpress';
+import { processImageBuffer } from './services/imageProcessor';
+import fetch from 'node-fetch';
 
 const connection = new IORedis(process.env.REDIS_URL!);
 new QueueScheduler('content-generation', { connection });
@@ -67,7 +69,7 @@ const worker = new Worker(
     }
 
     if (job.name === 'publish:article') {
-      const { articleId, websiteId, publishAs } = job.data as any;
+      const { articleId, websiteId, publishAs, categories = [], tags = [], featuredImageIndex } = job.data as any;
       const article = await prisma.article.findUnique({ where: { id: articleId }, include: { images: true } });
       if (!article) throw new Error('Article not found');
       const website = await prisma.website.findUnique({ where: { id: websiteId } });
@@ -79,15 +81,29 @@ const worker = new Worker(
         // upload featured image if present
         let featuredMediaId: number | undefined;
         if (article.images && article.images.length > 0) {
-          // take first image
-          const img = article.images[0];
-          // fetch image bytes
-          const res = await fetch(img.url);
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer());
-            const mime = res.headers.get('content-type') || 'image/jpeg';
-            const upload = await uploadMedia(website.siteUrl, website.username, wpPassword, buf, `featured-${article.slug}.jpg`, mime);
-            featuredMediaId = upload.id;
+          const idx = typeof featuredImageIndex === 'number' ? featuredImageIndex : 0;
+          const img = article.images[idx];
+          if (img) {
+            const res = await fetch(img.url);
+            if (res.ok) {
+              const buf = Buffer.from(await res.arrayBuffer());
+              // process image
+              const processed = await processImageBuffer(buf);
+              const mime = 'image/jpeg';
+              const filename = `featured-${article.slug}.jpg`;
+              const upload = await uploadMedia(website.siteUrl, website.username, wpPassword, processed as any, filename, mime);
+              featuredMediaId = upload.id;
+            }
+          }
+        }
+
+        // ensure tags exist (tags array may be numeric IDs or strings)
+        const tagIds: number[] = [];
+        for (const t of tags) {
+          if (typeof t === 'number') tagIds.push(t);
+          else if (typeof t === 'string') {
+            const id = await createTagIfNotExists(website.siteUrl, website.username, wpPassword, t);
+            tagIds.push(id);
           }
         }
 
@@ -97,6 +113,8 @@ const worker = new Worker(
           status: publishAs === 'publish' ? 'publish' : 'draft',
           excerpt: article.metaDescription || undefined,
           featured_media: featuredMediaId,
+          categories: Array.isArray(categories) ? categories : [],
+          tags: tagIds,
         };
 
         const published = await publishPost(website.siteUrl, website.username, wpPassword, post);
